@@ -5,21 +5,28 @@
 // requests: each answered with the best free model that meets its
 // requirements, and exiting 0 when the env says the workload is done.
 //
-// Routing is the change in v2. The trial's provider schedule — budget,
-// scheduled refusals, outage — is drawn per trial from a seed the entry
-// never receives: MAKEFUN_TRIAL_SEED hands it only a 64-bit derivative of
-// the instance seed, from which the seed cannot be recovered, and
-// GET /instance publishes no budgets or failure schedules either. So no
-// routing can promise zero refusals. Instead the planner caps each
-// provider's calls at a fixed per-trial number chosen to minimise the
-// EXPECTED refusals (Monte Carlo over the generator's published draw:
-// concentrate calls on the wide-budget providers, one call each on the
-// narrow ones), and assigns the twenty requests to those caps by
-// min-cost flow over the sealed quality table. Measured on the same Monte
-// Carlo: 23.0 upstream calls per trial at mean quality 98.5 (score 99 in
-// 100% of 500 three-trial finals), against the v1 entry's 29.9 calls at
-// quality 99.9. The runtime failover behind the plan absorbs whatever a
-// provider actually refuses.
+// Routing is the change in v2, revised again in v3. The trial's provider
+// schedule — budget, scheduled refusals, outage — is drawn per trial from
+// a seed the entry never receives: MAKEFUN_TRIAL_SEED hands it only a
+// 64-bit derivative of the instance seed, from which the seed cannot be
+// recovered, and GET /instance publishes no budgets or failure schedules
+// either. So no routing can promise zero refusals. Instead the planner
+// caps each provider's calls at a fixed per-trial number chosen to
+// minimise the EXPECTED refusals (Monte Carlo over the generator's
+// published draw: concentrate calls on the wide-budget providers, one
+// call each on the narrow ones), and assigns the twenty requests to those
+// caps by min-cost flow over the sealed quality table. And the runtime
+// failover behind the plan is no longer blind: it keeps the exact
+// Bayesian posterior over each provider's schedule (see lib/plan.ts),
+// updated from every call's outcome, orders each request's attempts by
+// the pairwise-optimal key rating - 50/p, and skips a planned pick the
+// posterior puts below 0.7 success instead of spending a call confirming
+// a dead provider. Measured on the same Monte Carlo: 22.4 upstream calls
+// per trial at mean quality 98.5 (score 99 in all but 1-2 trials in
+// 2,000), against the v2 entry's 23.1 calls at the same quality and the
+// v1 entry's 29.9 calls at quality 99.9. On the three practice trials
+// the v3 revision moves trial 0 from 22 calls to 21, so the practice
+// mean is 21.0 at score 99 on all three.
 //
 // Determinism: every choice is a function of the brief, the requests and
 // the providers' answers seen so far. No wall clock, no unseeded
@@ -47,7 +54,9 @@ import {
 import {
   candidatesFor,
   capsPlan,
+  FailurePosterior,
   optimalPlan,
+  orderAttempts,
   type Candidate,
 } from './lib/plan.ts';
 import {
@@ -142,6 +151,11 @@ function buildPlan(): (Candidate | null)[] {
 }
 
 let plan: (Candidate | null)[] = [];
+
+/** How many upstream calls each provider has taken this trial, success or refusal. */
+const callsMade = new Map<string, number>();
+/** The failure posterior over every provider's schedule, learning from each call's outcome. */
+const posterior = new FailurePosterior(brief.directory.providers.map((p) => p.id));
 
 /** Whether an OpenAI-client body asks for JSON mode. */
 function isJsonModeRequest(clientApi: 'openai' | 'anthropic', body: Json): boolean {
@@ -351,9 +365,13 @@ async function answerFrom(
 }
 
 /**
- * Serve one client request: try the planned pick first, then the remaining
- * ranked candidates, stopping at the first 2xx. Any non-2xx, fetch error or
- * timeout moves on immediately. No candidate is tried twice for one request.
+ * Serve one client request: the planned pick first unless the failure
+ * posterior says it is likely dead, then the remaining candidates in
+ * the Bayes-key order (see orderAttempts), stopping at the first 2xx.
+ * Any non-2xx, fetch error or timeout moves on immediately, and every
+ * attempt — success or refusal — is recorded in the posterior, so the
+ * order of the next request already knows what this one learned. No
+ * candidate is tried twice for one request.
  */
 async function serve(clientApi: 'openai' | 'anthropic', body: Json, res: ServerResponse): Promise<void> {
   const index = manifestIndex - 1;
@@ -362,7 +380,6 @@ async function serve(clientApi: 'openai' | 'anthropic', body: Json, res: ServerR
     : requirementsFromBody(body);
   const jsonMode = isJsonModeRequest(clientApi, body);
   const ranked = candidatesFor(brief, probes, requires, jsonMode);
-  const ordered: Candidate[] = [];
   // The planned pick is used only when it is still ranked for this request
   // as actually sent (a body carrying response_format where the manifest did
   // not flag json would rule an Anthropic-wire plan out, for instance).
@@ -372,16 +389,25 @@ async function serve(clientApi: 'openai' | 'anthropic', body: Json, res: ServerR
     ranked.some((c) => c.probe.provider.id === planned.probe.provider.id && c.model.id === planned.model.id)
       ? planned
       : null;
-  if (plannedUsable !== null) ordered.push(plannedUsable);
-  for (const candidate of ranked) {
-    if (plannedUsable !== null && candidate.probe.provider.id === plannedUsable.probe.provider.id && candidate.model.id === plannedUsable.model.id) continue;
-    ordered.push(candidate);
-  }
+  // The attempt order is recomputed after every refusal: the posterior
+  // the failed attempt just updated can demote the provider that failed
+  // (a failure makes an outage the likelier story for its later calls),
+  // so the next attempt must be chosen with the new probabilities, not
+  // the ones from before the request started. The simulation this
+  // ordering was measured with re-ranks the same way after each failure.
   const tried = new Set<string>();
-  for (const candidate of ordered) {
-    const key = `${candidate.probe.provider.id}/${candidate.model.id}`;
-    if (tried.has(key)) continue;
-    tried.add(key);
+  let firstAttempt = true;
+  for (;;) {
+    const ordered = orderAttempts(plannedUsable, ranked, callsMade, posterior);
+    const candidate = ordered.find((c) => !tried.has(`${c.probe.provider.id}/${c.model.id}`));
+    if (candidate === undefined) break;
+    if (firstAttempt && plannedUsable !== null && candidate !== plannedUsable) {
+      log(`skipping a likely-dead planned pick: ${plannedUsable.probe.provider.id}/${plannedUsable.model.id} (the posterior puts it below its skip threshold)`);
+    }
+    firstAttempt = false;
+    tried.add(`${candidate.probe.provider.id}/${candidate.model.id}`);
+    const providerId = candidate.probe.provider.id;
+    const callNumber = (callsMade.get(providerId) ?? 0) + 1;
     const call = upstreamFor(clientApi, body, candidate);
     let upstream: Response | null;
     try {
@@ -389,7 +415,13 @@ async function serve(clientApi: 'openai' | 'anthropic', body: Json, res: ServerR
     } catch {
       upstream = null;
     }
+    callsMade.set(providerId, callNumber);
     if (upstream === null || !upstream.ok) {
+      // Every attempt teaches the posterior something, whether the
+      // provider refused in its own envelope or the call never came
+      // back: a provider that just failed is more likely down than
+      // merely unlucky on one call number.
+      posterior.record(providerId, callNumber, false);
       if (upstream !== null) {
         try {
           await upstream.text();
@@ -399,6 +431,7 @@ async function serve(clientApi: 'openai' | 'anthropic', body: Json, res: ServerR
       }
       continue;
     }
+    posterior.record(providerId, callNumber, true);
     await answerFrom(clientApi, candidate, upstream, res);
     return;
   }
@@ -475,6 +508,7 @@ function poll(server: Server): void {
         const work: unknown = await res.json();
         if (isRecord(work) && work.done === true) {
           clearInterval(timer);
+          for (const line of posterior.describe()) log(`trial outcome: ${line}`);
           server.close();
           process.exit(0);
         }
@@ -498,6 +532,11 @@ async function start(): Promise<void> {
   }
   if (ENV_URL === '') throw new Error('MAKEFUN_ENV_URL is not set');
   plan = buildPlan();
+  if (!posterior.valid) {
+    log(
+      `failure posterior failed its checks (weights: ${[...posterior.weightSums()].map(([id, s]) => `${id} ${s.toFixed(6)}`).join(', ')}) — routing continues, but its probabilities are not the measured model's`,
+    );
+  }
   const server = createServer((req, res) => {
     void handle(req, res).catch((err: unknown) => {
       log((err as Error).stack ?? String(err));

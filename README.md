@@ -17,6 +17,21 @@ whatever a provider actually refuses. Measured on the same Monte Carlo:
 23.0 upstream calls per trial at mean quality 98.5 (score 99 in 100% of
 500 three-trial finals), against the v1 entry's 29.9 calls at quality 99.9.
 
+Version 3 keeps the caps plan and makes the failover learn. It keeps
+the exact Bayesian posterior over each provider's schedule — budget
+uniform on its published range, one or two scheduled fail calls,
+one provider in ten designated to fail its second call, one provider
+in ten going down from an outage call — updated from every call's
+outcome, orders each request's attempts by the pairwise-optimal key
+rating − 50/p, and skips a planned pick the posterior puts below 0.7
+success instead of spending a call confirming a dead provider. The
+attempt order is recomputed after every refusal, so the next attempt
+uses the probabilities the failure just updated. Measured on the same
+Monte Carlo: 22.4 upstream calls per trial at mean quality 98.5 (score
+99 in all but 1–2 trials in 2,000). On the three practice trials the
+revision moves trial 0 from 22 calls to 21 (trials 1–2 stay 21), so
+the practice mean is 21.0 at score 99 on all three.
+
 ## Run it
 
 ```sh
