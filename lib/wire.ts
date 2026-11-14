@@ -677,8 +677,8 @@ export function anthropicToOpenAIAnswer(body: Json, model: string): Json {
   };
 }
 
-/** A Gemini generateContent answer as a Chat Completions object. */
-export function geminiToOpenAIAnswer(body: Json, model: string): Json {
+/** The text, token counts and finish reason of a Gemini answer's first candidate. */
+function geminiAnswerParts(body: Json): { text: string; input: number; output: number; finish: unknown } {
   const candidates = Array.isArray(body.candidates) ? body.candidates : [];
   const candidate = isRecord(candidates[0]) ? candidates[0] : {};
   const content = isRecord(candidate.content) ? candidate.content : {};
@@ -687,37 +687,39 @@ export function geminiToOpenAIAnswer(body: Json, model: string): Json {
     .flatMap((p) => (isRecord(p) && typeof p.text === 'string' ? [p.text] : []))
     .join('');
   const meta = isRecord(body.usageMetadata) ? body.usageMetadata : {};
-  const input = numberOrZero(meta.promptTokenCount);
-  const output = numberOrZero(meta.candidatesTokenCount);
+  return {
+    text,
+    input: numberOrZero(meta.promptTokenCount),
+    output: numberOrZero(meta.candidatesTokenCount),
+    finish: candidate.finishReason,
+  };
+}
+
+/** A Gemini generateContent answer as a Chat Completions object. */
+export function geminiToOpenAIAnswer(body: Json, model: string): Json {
+  const answer = geminiAnswerParts(body);
   return {
     id: 'chatcmpl_gemini',
     object: 'chat.completion',
     created: FIXED_OPENAI_CREATED,
     model,
-    choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: finishReasonOfGemini(candidate.finishReason), logprobs: null }],
-    usage: { prompt_tokens: input, completion_tokens: output, total_tokens: input + output },
+    choices: [{ index: 0, message: { role: 'assistant', content: answer.text }, finish_reason: finishReasonOfGemini(answer.finish), logprobs: null }],
+    usage: { prompt_tokens: answer.input, completion_tokens: answer.output, total_tokens: answer.input + answer.output },
   };
 }
 
 /** A Gemini generateContent answer as an Anthropic Messages object. */
 export function geminiToAnthropicAnswer(body: Json, model: string): Json {
-  const candidates = Array.isArray(body.candidates) ? body.candidates : [];
-  const candidate = isRecord(candidates[0]) ? candidates[0] : {};
-  const content = isRecord(candidate.content) ? candidate.content : {};
-  const parts = Array.isArray(content.parts) ? content.parts : [];
-  const text = parts
-    .flatMap((p) => (isRecord(p) && typeof p.text === 'string' ? [p.text] : []))
-    .join('');
-  const meta = isRecord(body.usageMetadata) ? body.usageMetadata : {};
+  const answer = geminiAnswerParts(body);
   return {
     id: 'msg_gemini',
     type: 'message',
     role: 'assistant',
     model,
-    content: [{ type: 'text', text }],
-    stop_reason: stopReasonOfGemini(candidate.finishReason),
+    content: [{ type: 'text', text: answer.text }],
+    stop_reason: stopReasonOfGemini(answer.finish),
     stop_sequence: null,
-    usage: { input_tokens: numberOrZero(meta.promptTokenCount), output_tokens: numberOrZero(meta.candidatesTokenCount) },
+    usage: { input_tokens: answer.input, output_tokens: answer.output },
   };
 }
 

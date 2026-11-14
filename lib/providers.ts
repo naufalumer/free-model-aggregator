@@ -1,4 +1,4 @@
-// The trial brief: its three JSON documents, and the catalog probe.
+// The trial brief and the catalog probe.
 //
 // A trial hands this server one brief file (MAKEFUN_PROMPT_FILE). The prose
 // around the documents does not matter; each document is found by its
@@ -10,8 +10,8 @@
 //     to MAKEFUN_ENV_URL.
 //   - ratings    (`free-model-aggregator-01/ratings/v1`): every free model's
 //     rating in milli-points, context length, tools/vision/json capability
-//     flags and free flag, plus each request's best legal rating. This is the
-//     sealed truth for routing; the scorer ranks an answer by it.
+//     flags and free flag, plus each request's best legal rating. This is
+//     the sealed truth for routing; the scorer ranks an answer by it.
 //   - workload   (`free-model-aggregator-01/workload/v1`): the twenty
 //     requests in arrival order, each with api, stream flag, weight and the
 //     requirements a model must meet to serve it.
@@ -21,8 +21,8 @@
 // and the register body carries. A probe that fails drops its provider from
 // the catalog; the trial goes on without it.
 //
-// Everything here is deterministic: no clock, no randomness. The same brief
-// and the same provider answers always build the same catalog.
+// Nothing here reads a clock or draws at random: the same brief and the
+// same provider answers always build the same catalog.
 
 import { readFileSync } from 'node:fs';
 
@@ -166,14 +166,26 @@ export function authHeaders(auth: AuthScheme, key: string): Record<string, strin
   return {};
 }
 
+function textOrEmpty(v: unknown): string {
+  return typeof v === 'string' ? v : '';
+}
+
+function numOrNull(v: unknown): number | null {
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+
+function flagOrNull(v: unknown): boolean | null {
+  return typeof v === 'boolean' ? v : null;
+}
+
 /** Every JSON object in `text` carrying a string `schema`, in order of appearance. */
 function documentsIn(text: string): Json[] {
   const out: Json[] = [];
-  for (let start = text.indexOf('{'); start !== -1; start = text.indexOf('{', start + 1)) {
-    const end = objectEnd(text, start);
-    if (end === -1) continue;
+  for (let at = text.indexOf('{'); at !== -1; at = text.indexOf('{', at + 1)) {
+    const close = objectEnd(text, at);
+    if (close === -1) continue;
     try {
-      const value: unknown = JSON.parse(text.slice(start, end + 1));
+      const value: unknown = JSON.parse(text.slice(at, close + 1));
       if (isRecord(value) && typeof value.schema === 'string') out.push(value);
     } catch {
       // Not a JSON object on its own: look on.
@@ -201,21 +213,9 @@ function objectEnd(text: string, start: number): number {
   return -1;
 }
 
-function stringOf(v: unknown): string {
-  return typeof v === 'string' ? v : '';
-}
-
-function numberOrNull(v: unknown): number | null {
-  return typeof v === 'number' && Number.isFinite(v) ? v : null;
-}
-
-function boolOrNull(v: unknown): boolean | null {
-  return typeof v === 'boolean' ? v : null;
-}
-
 function providerOf(v: unknown): ProviderEntry | null {
   if (!isRecord(v)) return null;
-  const id = stringOf(v.id);
+  const id = textOrEmpty(v.id);
   const wire = v.wire === 'openai' || v.wire === 'anthropic' || v.wire === 'gemini' ? v.wire : null;
   if (id === '' || wire === null) return null;
   const auth =
@@ -224,34 +224,34 @@ function providerOf(v: unknown): ProviderEntry | null {
       : 'bearer';
   // The directory writes `path` (/p/<id>); an absolute base may use base_path, base_url or base.
   const base =
-    stringOf(v.path) !== ''
-      ? stringOf(v.path)
-      : stringOf(v.base_path) !== ''
-        ? stringOf(v.base_path)
-        : stringOf(v.base_url) !== ''
-          ? stringOf(v.base_url)
-          : stringOf(v.base);
+    textOrEmpty(v.path) !== ''
+      ? textOrEmpty(v.path)
+      : textOrEmpty(v.base_path) !== ''
+        ? textOrEmpty(v.base_path)
+        : textOrEmpty(v.base_url) !== ''
+          ? textOrEmpty(v.base_url)
+          : textOrEmpty(v.base);
   return {
     id,
-    name: stringOf(v.name) !== '' ? stringOf(v.name) : id,
+    name: textOrEmpty(v.name) !== '' ? textOrEmpty(v.name) : id,
     wire,
     auth,
     base,
-    key_env: stringOf(v.key_env),
-    key: stringOf(v.key),
+    key_env: textOrEmpty(v.key_env),
+    key: textOrEmpty(v.key),
   };
 }
 
 function ratingOf(v: unknown): RatingRow | null {
   if (!isRecord(v)) return null;
-  const model = stringOf(v.model);
-  const provider = stringOf(v.provider);
+  const model = textOrEmpty(v.model);
+  const provider = textOrEmpty(v.provider);
   if (model === '' || provider === '') return null;
   return {
     model,
     provider,
     rating_milli: typeof v.rating_milli === 'number' && Number.isFinite(v.rating_milli) ? v.rating_milli : 0,
-    context_length: numberOrNull(v.context_length),
+    context_length: numOrNull(v.context_length),
     tools: v.tools === true,
     vision: v.vision === true,
     json: v.json === true,
@@ -261,7 +261,7 @@ function ratingOf(v: unknown): RatingRow | null {
 
 function workloadRequestOf(v: unknown): WorkloadRequest | null {
   if (!isRecord(v)) return null;
-  const id = stringOf(v.id);
+  const id = textOrEmpty(v.id);
   if (id === '') return null;
   const requires = isRecord(v.requires) ? v.requires : {};
   return {
@@ -314,8 +314,8 @@ export function readBrief(path: string): Brief {
           }),
           best: Array.isArray(ratingsDoc.best)
             ? ratingsDoc.best.flatMap((v) => {
-                if (!isRecord(v) || stringOf(v.id) === '') return [];
-                return [{ id: stringOf(v.id), rating_milli: numberOrNull(v.rating_milli) ?? 0 }];
+                if (!isRecord(v) || textOrEmpty(v.id) === '') return [];
+                return [{ id: textOrEmpty(v.id), rating_milli: numOrNull(v.rating_milli) ?? 0 }];
               })
             : [],
         };
@@ -384,23 +384,23 @@ function zeroPriced(v: Json): boolean | null {
 /** One model as a listing wrote it, in whichever wire's spelling. */
 function modelIn(wire: Wire, v: unknown): ListedModel | null {
   if (!isRecord(v)) return null;
-  const id = wire === 'gemini' ? stringOf(v.name).replace(/^models\//, '') : stringOf(v.id);
+  const id = wire === 'gemini' ? textOrEmpty(v.name).replace(/^models\//, '') : textOrEmpty(v.id);
   if (id === '') return null;
   const context =
-    numberOrNull(v.context_length) ?? numberOrNull(v.context_window) ?? numberOrNull(v.inputTokenLimit);
+    numOrNull(v.context_length) ?? numOrNull(v.context_window) ?? numOrNull(v.inputTokenLimit);
   return {
     id,
     display_name:
-      stringOf(v.display_name) !== ''
-        ? stringOf(v.display_name)
-        : stringOf(v.displayName) !== ''
-          ? stringOf(v.displayName)
+      textOrEmpty(v.display_name) !== ''
+        ? textOrEmpty(v.display_name)
+        : textOrEmpty(v.displayName) !== ''
+          ? textOrEmpty(v.displayName)
           : id,
-    free: boolOrNull(v.free) ?? zeroPriced(v),
+    free: flagOrNull(v.free) ?? zeroPriced(v),
     context_length: context,
-    tools: boolOrNull(v.tools),
-    vision: boolOrNull(v.vision),
-    json: boolOrNull(v.json),
+    tools: flagOrNull(v.tools),
+    vision: flagOrNull(v.vision),
+    json: flagOrNull(v.json),
   };
 }
 

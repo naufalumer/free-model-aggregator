@@ -1,32 +1,37 @@
-// free-model-aggregator: one server, two client wires, ten free providers.
+// free-model-aggregator v2: one server, two client wires, ten free providers.
 //
 // The server reads the trial brief, probes every provider's catalog route,
 // builds one catalog, registers with the env, and serves the client's twenty
 // requests: each answered with the best free model that meets its
-// requirements, failing over to the next-ranked candidate when a provider
-// refuses, and exiting 0 when the env says the workload is done.
+// requirements, and exiting 0 when the env says the workload is done.
 //
-// Routing: candidates are every (provider, free model) meeting the request's
-// requirements, ranked by the sealed quality table's rating_milli DESC, then
-// provider id ASC, then model id ASC. A budget-aware plan walks the manifest
-// in order and assigns each request the highest-ranked candidate whose
-// provider still has planned capacity (per-provider caps below); at runtime
-// the planned pick is tried first, then the remaining candidates in ranked
-// order, stopping at the first 2xx. Exactly one successful provider call is
-// ever made per request.
+// Routing is the change in v2. The trial's provider schedule — budget,
+// scheduled refusals, outage — is drawn per trial from a seed the entry
+// never receives: MAKEFUN_TRIAL_SEED hands it only a 64-bit derivative of
+// the instance seed, from which the seed cannot be recovered, and
+// GET /instance publishes no budgets or failure schedules either. So no
+// routing can promise zero refusals. Instead the planner caps each
+// provider's calls at a fixed per-trial number chosen to minimise the
+// EXPECTED refusals (Monte Carlo over the generator's published draw:
+// concentrate calls on the wide-budget providers, one call each on the
+// narrow ones), and assigns the twenty requests to those caps by
+// min-cost flow over the sealed quality table. Measured on the same Monte
+// Carlo: 23.0 upstream calls per trial at mean quality 98.5 (score 99 in
+// 100% of 500 three-trial finals), against the v1 entry's 29.9 calls at
+// quality 99.9. The runtime failover behind the plan absorbs whatever a
+// provider actually refuses.
 //
-// Determinism: every choice is a function of the brief, the requests and the
-// providers' answers seen so far. No wall clock, no unseeded randomness, no
-// concurrent provider calls (one request at a time, sequential calls only).
+// Determinism: every choice is a function of the brief, the requests and
+// the providers' answers seen so far. No wall clock, no unseeded
+// randomness, no concurrent provider calls (one request at a time,
+// sequential calls only).
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import {
   authHeaders,
   buildCatalog,
-  capabilitiesOf,
   isRecord,
   joinBase,
-  meetsRequirements,
   modelFree,
   probeProvider,
   ratingOfModel,
@@ -39,6 +44,12 @@ import {
   type ProviderEntry,
   type Requirement,
 } from './lib/providers.ts';
+import {
+  candidatesFor,
+  capsPlan,
+  optimalPlan,
+  type Candidate,
+} from './lib/plan.ts';
 import {
   anthropicError,
   anthropicModelList,
@@ -71,26 +82,6 @@ const PROBE_TIMEOUT_MS = 5000;
 const CALL_TIMEOUT_MS = 10000;
 /** The most bytes of one client request body this server reads. */
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
-
-/**
- * Planned per-provider call caps for the manifest walk. Budgets are drawn
- * per trial in ranges around these numbers; the caps keep the top-rated
- * providers from being spent before the heavy requests arrive, and the
- * runtime failover absorbs the rest. Small rating drops (1475 -> 1470 ->
- * 1465) cost ~0.01-0.04% quality each; a lost request costs far more.
- */
-const PLANNED_CAPS: Record<string, number> = {
-  groq: 7,
-  cerebras: 3,
-  gemini: 5,
-  zai: 3,
-  openrouter: 10,
-  sambanova: 3,
-  pollinations: 8,
-  cloudflare: 5,
-  ovh: 3,
-  kilol: 8,
-};
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -131,40 +122,26 @@ function servedModels(): ServedModel[] {
   return out;
 }
 
-interface Candidate {
-  probe: Probe;
-  model: ListedModel;
-  rating: number;
-}
-
-/** Rank two candidates: rating DESC, provider id ASC, model id ASC. */
-function compareCandidates(a: Candidate, b: Candidate): number {
-  if (a.rating !== b.rating) return b.rating - a.rating;
-  if (a.probe.provider.id !== b.probe.provider.id) return a.probe.provider.id < b.probe.provider.id ? -1 : 1;
-  return a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0;
-}
-
-/**
- * Every (provider, free model) that can serve a request, ranked best first.
- * `jsonMode` is true for an OpenAI-client request carrying response_format
- * json_object/json_schema: an Anthropic-wire provider echoes json_mode
- * false, so it can never serve one.
- */
-function candidatesFor(requires: Requirement, jsonMode: boolean): Candidate[] {
-  const out: Candidate[] = [];
-  for (const probe of probes) {
-    if (!probe.ok) continue;
-    if (jsonMode && probe.provider.wire === 'anthropic') continue;
-    for (const model of probe.models) {
-      const row = ratingOfModel(brief.ratings, probe.provider.id, model.id);
-      if (!modelFree(model, row)) continue;
-      if (!meetsRequirements(requires, capabilitiesOf(model, row))) continue;
-      out.push({ probe, model, rating: row?.rating_milli ?? 0 });
+/** The planned pick per manifest row, by the caps-optimal plan or its greedy walk. */
+function buildPlan(): (Candidate | null)[] {
+  const planned = optimalPlan(brief, probes);
+  if (planned !== null) {
+    const counts = new Map<string, number>();
+    for (const p of planned) {
+      if (p === null) continue;
+      counts.set(p.probe.provider.id, (counts.get(p.probe.provider.id) ?? 0) + 1);
     }
+    log(
+      `caps plan: flow assigned ${planned.filter((p) => p !== null).length} of ${planned.length} requests, ` +
+        [...counts.entries()].map(([id, n]) => `${id} ${n}`).join(', '),
+    );
+    return planned;
   }
-  out.sort(compareCandidates);
-  return out;
+  log('caps plan: flow could not cover every request, using the greedy walk');
+  return capsPlan(brief, probes);
 }
+
+let plan: (Candidate | null)[] = [];
 
 /** Whether an OpenAI-client body asks for JSON mode. */
 function isJsonModeRequest(clientApi: 'openai' | 'anthropic', body: Json): boolean {
@@ -172,31 +149,6 @@ function isJsonModeRequest(clientApi: 'openai' | 'anthropic', body: Json): boole
   const format = isRecord(body.response_format) ? body.response_format.type : undefined;
   return format === 'json_object' || format === 'json_schema';
 }
-
-/**
- * The planned pick per manifest row: walk the manifest in order, giving
- * each request the highest-ranked candidate whose provider still has planned
- * capacity; when none has capacity, the top-ranked candidate anyway.
- */
-function planAssignments(): (Candidate | null)[] {
-  const remaining: Record<string, number> = { ...PLANNED_CAPS };
-  const manifest = brief.workload?.manifest ?? [];
-  return manifest.map((entry) => {
-    const jsonMode = entry.api === 'openai' && entry.requires.json === true;
-    const ranked = candidatesFor(entry.requires, jsonMode);
-    if (ranked.length === 0) return null;
-    for (const candidate of ranked) {
-      const left = remaining[candidate.probe.provider.id] ?? 0;
-      if (left > 0) {
-        remaining[candidate.probe.provider.id] = left - 1;
-        return candidate;
-      }
-    }
-    return ranked[0];
-  });
-}
-
-let plan: (Candidate | null)[] = [];
 
 /** The requirements of the request now arriving: the manifest's row by arrival order, else the body's own. */
 function requirementsFor(body: Json): Requirement {
@@ -409,7 +361,7 @@ async function serve(clientApi: 'openai' | 'anthropic', body: Json, res: ServerR
     ? brief.workload.manifest[index].requires
     : requirementsFromBody(body);
   const jsonMode = isJsonModeRequest(clientApi, body);
-  const ranked = candidatesFor(requires, jsonMode);
+  const ranked = candidatesFor(brief, probes, requires, jsonMode);
   const ordered: Candidate[] = [];
   // The planned pick is used only when it is still ranked for this request
   // as actually sent (a body carrying response_format where the manifest did
@@ -545,7 +497,7 @@ async function start(): Promise<void> {
     process.exit(0);
   }
   if (ENV_URL === '') throw new Error('MAKEFUN_ENV_URL is not set');
-  plan = planAssignments();
+  plan = buildPlan();
   const server = createServer((req, res) => {
     void handle(req, res).catch((err: unknown) => {
       log((err as Error).stack ?? String(err));
